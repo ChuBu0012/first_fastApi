@@ -1,7 +1,10 @@
 from fastapi import FastAPI, status, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from enum import Enum
 from typing import List
+
+origins = ['*']
 
 class TodoStatus(str,Enum):
     pending = "pending"
@@ -15,6 +18,14 @@ class Todo(BaseModel):
     status : TodoStatus | None = None
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_headers=["*"],
+    allow_methods=["*"]
+)
 
 items :List[Todo] = [
     {
