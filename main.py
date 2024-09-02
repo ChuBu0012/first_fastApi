@@ -1,107 +1,109 @@
-from fastapi import FastAPI, status, HTTPException
+from fastapi import FastAPI, status, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from enum import Enum
 from typing import List
+from sqlalchemy import create_engine, Column, Integer, String, Enum as SQLAlchemyEnum
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.future import select
+from sqlalchemy.orm import Session
 
-origins = ['*']
+# Database setup
+DATABASE_URL = "sqlite:///./test.db"
 
-class TodoStatus(str,Enum):
-    pending = "pending"
-    in_process = "in_process"
-    completed = "completed"
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 
-class Todo(BaseModel):
-    id : int | None = None
-    name : str | None = None
-    detail : str | None = None
-    status : TodoStatus | None = None
-
+# FastAPI setup
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_headers=["*"],
     allow_methods=["*"]
 )
 
-items :List[Todo] = [
-    {
-        "id": 1,
-        "name": "Buy groceries",
-        "detail": "Milk, Bread, Eggs",
-        "status": "pending"
-    },
-    {
-        "id": 2,
-        "name": "Complete homework",
-        "detail": "Math exercises",
-        "status": "in_process"
-    },
-    {
-        "id": 3,
-        "name": "Call mom",
-        "detail": None,
-        "status": "completed"
-    },
-    {
-        "id": 4,
-        "name": "Read a book",
-        "detail": "The Catcher in the Rye",
-        "status": "pending"
-    },
-    {
-        "id": 5,
-        "name": "Prepare dinner",
-        "detail": "Pasta and salad",
-        "status": "in_process"
-    }
-]
+# Enum and Pydantic model
+class TodoStatus(str, Enum):
+    pending = "pending"
+    in_process = "in_process"
+    completed = "completed"
 
+class TodoBase(BaseModel):
+    name: str | None = None
+    detail: str | None = None
+    status: TodoStatus | None = None
 
-next_id = 6
+class TodoCreate(TodoBase):
+    pass
 
-@app.post("/createTodo", status_code=status.HTTP_201_CREATED)
-async def createTodo(new_todo: Todo):
-    global next_id
-    new_todo.id = next_id
-    new_todo.status = TodoStatus.pending
-    items.append(new_todo)
-    next_id += 1
-    return {"message": "Create Successful!"}
+class TodoDB(TodoBase):
+    id: int
 
-@app.get("/getTodos",status_code=status.HTTP_200_OK)
-async def getTodos():
-    return items
+    class Config:
+        orm_mode = True
 
-@app.get("/getTodos/{todo_id}", status_code=status.HTTP_200_OK)
-async def getTodosById(todo_id: int):
-    todo = next((item for item in items if item['id'] == todo_id), None)
-    if todo is not None:
-        return todo
-    else:
+# SQLAlchemy model
+class TodoModel(Base):
+    __tablename__ = "todos"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, index=True)
+    detail = Column(String, index=True, nullable=True)
+    status = Column(SQLAlchemyEnum(TodoStatus), default=TodoStatus.pending)
+
+# Create tables
+Base.metadata.create_all(bind=engine)
+
+# Dependency to get DB session
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# Routes
+@app.post("/createTodo", response_model=TodoDB, status_code=status.HTTP_201_CREATED)
+async def create_todo(new_todo: TodoCreate, db: Session = Depends(get_db)):
+    todo = TodoModel(**new_todo.dict())
+    db.add(todo)
+    db.commit()
+    db.refresh(todo)
+    return todo
+
+@app.get("/getTodos", response_model=List[TodoDB], status_code=status.HTTP_200_OK)
+async def get_todos(db: Session = Depends(get_db)):
+    todos = db.execute(select(TodoModel)).scalars().all()
+    return todos
+
+@app.get("/getTodos/{todo_id}", response_model=TodoDB, status_code=status.HTTP_200_OK)
+async def get_todo_by_id(todo_id: int, db: Session = Depends(get_db)):
+    todo = db.get(TodoModel, todo_id)
+    if todo is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Todo not found")
+    return todo
 
-@app.put("/updateTodo/{todo_id}", status_code=status.HTTP_200_OK)
-async def updateTodo(todo_id: int, todo: Todo):
-    index = next((i for i, item in enumerate(items) if item['id'] == todo_id), None)
-    if index is not None:
-        existing_todo = items[index]
-        updated_todo = existing_todo.copy()  # Make a copy of the existing todo
-        updated_todo.update(todo.dict(exclude_unset=True))  # Update the copy with new values
-        items[index] = updated_todo  # Replace the old todo with the updated one
-        return {"message": f"Updated Todo with id {todo_id}."}
-    else:
+@app.put("/updateTodo/{todo_id}", response_model=TodoDB, status_code=status.HTTP_200_OK)
+async def update_todo(todo_id: int, todo_data: TodoBase, db: Session = Depends(get_db)):
+    todo = db.get(TodoModel, todo_id)
+    if todo is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Todo not found")
+    for key, value in todo_data.dict(exclude_unset=True).items():
+        setattr(todo, key, value)
+    db.commit()
+    db.refresh(todo)
+    return todo
 
-
-@app.delete("/deleteTodo/{todo_id}",status_code=status.HTTP_200_OK)
-async def deleteTodo(todo_id:int):
-    index = next((i for i,item in enumerate(items) if item['id'] == todo_id),None)
-    if index is not None:
-        items.pop(index)
-        return {"message": f"Deleted Todo with id {todo_id}."}
-    else:
+@app.delete("/deleteTodo/{todo_id}", status_code=status.HTTP_200_OK)
+async def delete_todo(todo_id: int, db: Session = Depends(get_db)):
+    todo = db.get(TodoModel, todo_id)
+    if todo is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Todo not found")
+    db.delete(todo)
+    db.commit()
+    return {"message": f"Deleted Todo with id {todo_id}."}
